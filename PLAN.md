@@ -316,14 +316,28 @@ struct ExecOutput { result: serde_json::Value, stdout: String, stderr: String }
    `python3`). Verified end-to-end via `CODEMCP_SMOKE`: Python calls
    `everything_get_sum(a=2,b=40)` → `call_tool` over WS → upstream → result
    transformed in one Python step.
-5. `server.rs` + `main.rs`: **stdio server serving `execute_python` → host executor.
-   First working vertical slice.**
-6. Add Streamable HTTP server transport.
-7. `exec/docker.rs`.
-8. `exec/monty.rs` (feature-gated) + type-check stubs.
-9. Optional LLM summaries + cache.
-10. README: env vars, isolation trade-offs, Monty Python-subset limits + security
-    boundaries.
+5. [DONE] `server.rs` + `main.rs`: **stdio server serving `execute_python` → host
+   executor.** First working vertical slice verified with a stdio MCP client:
+   `initialize` → `tools/list` (single `execute_python` tool carrying the SDK
+   description) → `tools/call` running Python that calls `everything_get_sum` and
+   returns structured `{"answer": "...42."}`. Clean worker shutdown on gateway exit.
+6. [DONE] Add Streamable HTTP server transport. `main.rs` mounts the
+   `CodeServer` as a `StreamableHttpService` on an `axum` router
+   (`nest_service(http_path, service)` + `axum::serve`), sharing the single
+   Python worker across sessions via a cloning service factory. New env vars
+   `CODEMCP_HTTP_PATH` (default `/mcp`) and `CODEMCP_HTTP_JSON_RESPONSE`
+   (stateless plain-JSON vs. stateful SSE). Verified with curl: stateless
+   json-response init + `tools/call execute_python` → `everything_get_sum(15,27)`
+   → `{"answer":"...42."}`; stateful SSE init returns `mcp-session-id` + SSE-framed
+   response. deps: `axum 0.8`.
+7. [TODO] `exec/docker.rs`. Documented as planned work in `README.md`.
+8. [TODO] `exec/monty.rs` (feature-gated) + type-check stubs. Documented as
+   planned work in `README.md`.
+9. [TODO] Optional LLM summaries + cache. Documented as planned work in
+   `README.md`.
+10. [DONE] `README.md`: concept/why, quick start, config format, how-it-works,
+    full `CODEMCP_*` env var reference, isolation trade-offs + security
+    boundaries, and a TODO section for phases 7–9.
 
 ---
 
@@ -346,3 +360,46 @@ stays `HOST_SYSTEM`; **DOCKER** is the recommended isolation for untrusted agent
   routes to authenticated upstream MCP servers, so it is gated by a per-run shared
   token (`CODEMCP_CONTROL_TOKEN`, first WS frame). Bind loopback by default; never
   expose the control port publicly without TLS + a strong token.
+
+---
+
+## 10. Runtime Admin: enable/disable upstreams without restart
+
+A separate `codemcp` CLI mutates the **live** gateway's connected upstream set
+without restarting it.
+
+### Source of truth
+- `mcp.json` = **boot-time desired state** (what connects at startup).
+- Admin commands mutate **runtime state only**. They do **not** edit `mcp.json`
+  unless `--make-default` is passed (which writes the new `enabled` value back).
+
+### Transport: admin Unix socket
+- Gateway listens on a Unix domain socket. Path: `CODEMCP_ADMIN_SOCKET`
+  (default `~/.config/codemcp/admin.sock`).
+- Line-delimited JSON-RPC 2.0 (one request, one response, then close):
+  - `list` -> `[{ name, type, enabled_in_config, connected, tools }]`
+  - `enable { name, make_default? }` -> reconciled status
+  - `disable { name, make_default? }` -> reconciled status
+- Loopback-only filesystem socket; perms 0600.
+
+### Shared runtime state
+`UpstreamManager` gains interior mutability (`RwLock<HashMap<..>>`) and:
+- `connect_one(cfg)` / `disconnect_one(name)` at runtime.
+- non-consuming `shutdown(&self)`.
+A `Runtime` holds the manager, the boot config map, the current `SdkRegistry` +
+description (behind a lock), and the set of captured server `Peer`s.
+
+### Reconcile flow (enable)
+1. Look up the server in the boot config map (must exist there).
+2. `connect_one` -> list tools.
+3. Rebuild `SdkRegistry` + `execute_python` description from all connected tools.
+4. Push `reload { sdk }` to the worker over the control channel; worker re-imports
+   the module and re-injects the SDK functions (no worker restart, state kept).
+5. Send `notifications/tools/list_changed` to every captured MCP peer so the
+   client re-reads the updated `execute_python` description.
+
+### CLI (clap derive; already a dependency)
+- No subcommand -> run the gateway (current behavior; default).
+- `codemcp list` / `codemcp enable NAME [--make-default]` /
+  `codemcp disable NAME [--make-default]` -> connect to the admin socket, send the
+  command, print the result.

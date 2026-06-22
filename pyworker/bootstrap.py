@@ -249,3 +249,11 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception as exc:  # pragma: no cover
+        # The gateway closing the control channel is a normal shutdown signal;
+        # exit quietly rather than dumping a traceback.
+        import websockets.exceptions as _wse
+
+        if isinstance(exc, (_wse.ConnectionClosed, ConnectionError, OSError)):
+            sys.exit(0)
+        raise

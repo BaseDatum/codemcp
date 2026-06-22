@@ -41,6 +41,11 @@ pub struct Settings {
     pub isolation: Isolation,
     pub transport: ServerTransport,
     pub http_bind: SocketAddr,
+    /// URL path the Streamable HTTP MCP endpoint is mounted at.
+    pub http_path: String,
+    /// When true, the HTTP transport replies with plain `application/json` for
+    /// request/response calls instead of SSE framing (stateless mode only).
+    pub http_json_response: bool,
 
     pub python: Option<PathBuf>,
     pub docker_image: String,
@@ -78,6 +83,8 @@ impl Default for Settings {
             isolation: Isolation::HostSystem,
             transport: ServerTransport::Stdio,
             http_bind: "127.0.0.1:3388".parse().expect("valid default addr"),
+            http_path: "/mcp".to_string(),
+            http_json_response: false,
             python: None,
             docker_image: "python:3.14-slim".to_string(),
             docker_extra_args: Vec::new(),

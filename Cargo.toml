@@ -39,6 +39,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 figment = { version = "0.10", features = ["env"] }
+axum = "0.8"
 
 # The Monty Rust crate is not published to crates.io under this name; pull from git.
 # Feature-gated and off by default, so default builds never fetch it.

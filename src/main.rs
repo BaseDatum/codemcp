@@ -10,17 +10,25 @@ mod error;
 mod exec;
 mod prompt;
 mod sdk;
+mod server;
 mod upstream;
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
+use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::env::Settings;
+use crate::env::{ServerTransport, Settings};
 use crate::exec::host::HostExecutor;
 use crate::exec::Executor;
 use crate::sdk::SdkRegistry;
+use crate::server::CodeServer;
 use crate::upstream::UpstreamManager;
 
 #[tokio::main]
@@ -78,7 +86,47 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Subsequent phases wire up: server.
+    // Start the Python worker, build the SDK description, and serve.
+    let executor = HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?;
+    let description = prompt::build_description(&registry, settings.isolation);
+    let code_server = CodeServer::new(Box::new(executor), description);
+
+    match settings.transport {
+        ServerTransport::Stdio => {
+            tracing::info!("serving execute_python over stdio");
+            let running = code_server
+                .serve(stdio())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start stdio server: {e}"))?;
+            running
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("server task error: {e}"))?;
+        }
+        ServerTransport::Http => {
+            let config = StreamableHttpServerConfig::default()
+                .with_stateful_mode(!settings.http_json_response)
+                .with_json_response(settings.http_json_response);
+            // Each session shares the single Python worker via the cloned server.
+            let factory_server = code_server.clone();
+            let service = StreamableHttpService::new(
+                move || Ok(factory_server.clone()),
+                Arc::new(LocalSessionManager::default()),
+                config,
+            );
+
+            let app = axum::Router::new().nest_service(&settings.http_path, service);
+            let listener = tokio::net::TcpListener::bind(settings.http_bind).await?;
+            tracing::info!(
+                bind = %settings.http_bind,
+                path = %settings.http_path,
+                "serving execute_python over Streamable HTTP"
+            );
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| anyhow::anyhow!("http server error: {e}"))?;
+        }
+    }
 
     if let Ok(m) = Arc::try_unwrap(upstreams) {
         m.shutdown().await;
