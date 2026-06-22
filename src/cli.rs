@@ -20,25 +20,54 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Selects which running gateway an admin command targets when more than one is
+/// live. Matches a substring of the config path, or an exact PID.
+#[derive(clap::Args, Clone, Default)]
+pub struct InstanceSel {
+    /// Target a specific gateway by launcher name, config-path substring, or
+    /// PID (only needed when multiple gateways are running).
+    #[arg(short = 'i', long, global = true)]
+    pub instance: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
+    /// Run a long-lived Streamable HTTP gateway on a fixed port, suitable for
+    /// sharing one codemcp instance between multiple harnesses.
+    Start {
+        /// TCP port to bind the HTTP MCP endpoint on. Fails if already in use.
+        #[arg(short = 'p', long)]
+        port: u16,
+        /// Address to bind (default 127.0.0.1).
+        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// List all running codemcp gateways (one per harness, plus any `start`ed).
+    Instances,
     /// List configured upstream servers and their live connection status.
-    List,
+    List {
+        #[command(flatten)]
+        instance: InstanceSel,
+    },
     /// Connect an upstream in the running gateway (no restart).
     Enable {
         /// Server name as it appears in mcp.json.
         name: String,
         /// Also persist `enabled: true` to mcp.json (changes boot default).
-        #[arg(long)]
+        #[arg(short = 'd', long)]
         make_default: bool,
+        #[command(flatten)]
+        instance: InstanceSel,
     },
     /// Disconnect an upstream in the running gateway (no restart).
     Disable {
         /// Server name as it appears in mcp.json.
         name: String,
         /// Also persist `enabled: false` to mcp.json (changes boot default).
-        #[arg(long)]
+        #[arg(short = 'd', long)]
         make_default: bool,
+        #[command(flatten)]
+        instance: InstanceSel,
     },
     /// Wire codemcp into an agent harness: back up its config, move its MCP
     /// servers into codemcp's mcp.json, and point the harness at codemcp.
@@ -54,6 +83,11 @@ impl Command {
     pub fn is_local(&self) -> bool {
         matches!(self, Command::Setup { .. })
     }
+
+    /// Whether this command runs the gateway itself (i.e. `start`).
+    pub fn is_gateway(&self) -> bool {
+        matches!(self, Command::Start { .. })
+    }
 }
 
 /// Run a local (non-admin) subcommand. Currently just `setup`.
@@ -67,26 +101,50 @@ pub fn run_local(cmd: Command) -> Result<(), Error> {
 /// Run an admin subcommand against a live gateway. Prints human-readable output.
 pub async fn run_admin(cmd: Command) -> Result<(), Error> {
     match cmd {
-        Command::List => {
-            let resp = admin::client_request("list", json!({})).await?;
+        Command::Instances => {
+            let instances = admin::live_instances().await;
+            if instances.is_empty() {
+                println!("no running codemcp gateways found");
+            } else {
+                println!("{:<14} {:<8} CONFIG", "LAUNCHER", "PID");
+                for i in &instances {
+                    println!("{:<14} {:<8} {}", i.launcher, i.pid, i.config);
+                }
+            }
+        }
+        Command::List { instance } => {
+            let target = admin::select_instance(instance.instance.as_deref()).await?;
+            println!("# gateway [{}] pid {}", target.launcher, target.pid);
+            let resp = admin::client_request(instance.instance.as_deref(), "list", json!({})).await?;
             print_list(&resp);
         }
-        Command::Enable { name, make_default } => {
+        Command::Enable {
+            name,
+            make_default,
+            instance,
+        } => {
             let resp = admin::client_request(
+                instance.instance.as_deref(),
                 "enable",
                 json!({ "name": name, "make_default": make_default }),
             )
             .await?;
             print_action("enabled", &resp);
         }
-        Command::Disable { name, make_default } => {
+        Command::Disable {
+            name,
+            make_default,
+            instance,
+        } => {
             let resp = admin::client_request(
+                instance.instance.as_deref(),
                 "disable",
                 json!({ "name": name, "make_default": make_default }),
             )
             .await?;
             print_action("disabled", &resp);
         }
+        Command::Start { .. } => unreachable!("start is handled by run_gateway"),
         Command::Setup { .. } => unreachable!("setup is handled by run_local"),
     }
     Ok(())

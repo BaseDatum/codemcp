@@ -1,11 +1,12 @@
 //! Connect to a single upstream MCP server (stdio or streamable-http).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::{
-    streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
-    TokioChildProcess,
+    streamable_http_client::StreamableHttpClientTransportConfig, IntoTransport,
+    StreamableHttpClientTransport, TokioChildProcess,
 };
 use rmcp::ServiceExt;
 use tokio::process::Command;
@@ -17,6 +18,10 @@ use crate::error::Error;
 /// client that just doesn't react to server-initiated requests.
 pub type UpstreamService = RunningService<RoleClient, ()>;
 
+/// Default time to wait for an upstream to spawn and complete the MCP
+/// handshake when the config does not specify a `timeout`.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// Connect to the upstream described by `spec`.
 pub(crate) async fn connect(name: &str, spec: &ServerSpec) -> Result<UpstreamService, Error> {
     match spec {
@@ -24,9 +29,37 @@ pub(crate) async fn connect(name: &str, spec: &ServerSpec) -> Result<UpstreamSer
             command,
             environment,
             cwd,
+            timeout,
             ..
-        } => connect_stdio(name, command, environment, cwd.as_deref()).await,
-        ServerSpec::Remote { url, headers, .. } => connect_http(name, url, headers).await,
+        } => connect_stdio(name, command, environment, cwd.as_deref(), *timeout).await,
+        ServerSpec::Remote {
+            url,
+            headers,
+            timeout,
+            ..
+        } => connect_http(name, url, headers, *timeout).await,
+    }
+}
+
+/// Drive the MCP handshake to completion, failing if it does not finish within
+/// the configured (or default) timeout.
+async fn serve_with_timeout<T, E, A>(
+    name: &str,
+    transport: T,
+    timeout: Option<u64>,
+) -> Result<UpstreamService, Error>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let secs = timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS);
+    let fut = ().serve(transport);
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(Ok(service)) => Ok(service),
+        Ok(Err(e)) => Err(Error::Upstream(format!("{name}: initialize failed: {e}"))),
+        Err(_) => Err(Error::Upstream(format!(
+            "{name}: timed out after {secs}s waiting for the server to initialize"
+        ))),
     }
 }
 
@@ -35,6 +68,7 @@ async fn connect_stdio(
     command: &[String],
     environment: &BTreeMap<String, String>,
     cwd: Option<&str>,
+    timeout: Option<u64>,
 ) -> Result<UpstreamService, Error> {
     let (program, args) = command
         .split_first()
@@ -52,17 +86,14 @@ async fn connect_stdio(
     let transport = TokioChildProcess::new(cmd)
         .map_err(|e| Error::Upstream(format!("{name}: spawn failed: {e}")))?;
 
-    let service = ()
-        .serve(transport)
-        .await
-        .map_err(|e| Error::Upstream(format!("{name}: initialize failed: {e}")))?;
-    Ok(service)
+    serve_with_timeout(name, transport, timeout).await
 }
 
 async fn connect_http(
     name: &str,
     url: &str,
     headers: &BTreeMap<String, String>,
+    timeout: Option<u64>,
 ) -> Result<UpstreamService, Error> {
     let transport = if headers.is_empty() {
         StreamableHttpClientTransport::from_uri(url.to_string())
@@ -89,9 +120,5 @@ async fn connect_http(
         StreamableHttpClientTransport::with_client(client, config)
     };
 
-    let service = ()
-        .serve(transport)
-        .await
-        .map_err(|e| Error::Upstream(format!("{name}: initialize failed: {e}")))?;
-    Ok(service)
+    serve_with_timeout(name, transport, timeout).await
 }

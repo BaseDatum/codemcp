@@ -133,6 +133,9 @@ verbatim** into codemcp's `mcp.json`, and rewrites opencode to launch a single
    - `type: "remote"` → Streamable HTTP server at `url` (with optional `headers`).
    - Any string value supports `{env:VAR}` interpolation.
    - `"enabled": false` skips an entry.
+   - `"timeout": <seconds>` caps how long to wait for that upstream to spawn and
+     finish the MCP handshake (default 30s). An upstream that exceeds it is
+     logged and skipped rather than blocking startup.
 
 2. Run the gateway:
 
@@ -189,6 +192,47 @@ re-read the updated `execute_python` description.
 > Note: `--make-default` rewrites `mcp.json` (preserving all values) and may
 > reorder keys alphabetically.
 
+Most flags have short forms: `-d` (`--make-default`), `-i` (`--instance`),
+`-p` (`--port`), `-H` (`--host`).
+
+## Running multiple gateways (one per harness)
+
+You can point several harnesses at codemcp at once — e.g. opencode **and** LM
+Studio. Two ways:
+
+**A. One gateway per harness (default, stdio).** Each harness launches its own
+`codemcp` process. These are fully independent: each gets its own upstream
+connections, Python worker, and a **per-instance admin socket**
+(`~/.config/codemcp/admin-<config-hash>-<pid>.sock`), so they never collide.
+
+Each gateway records which application launched it — from
+`CODEMCP_INSTANCE_LABEL` if set (the `setup` command writes `opencode`), else the
+auto-detected parent process name (e.g. `lmstudio`). List them and target one:
+
+```bash
+codemcp instances            # show every running gateway
+# LAUNCHER       PID      CONFIG
+# opencode       40012    /Users/you/.config/codemcp/mcp.json
+# lmstudio       40988    /Users/you/.config/codemcp/mcp.json
+
+codemcp list -i opencode             # admin commands target a specific gateway
+codemcp enable github -i lmstudio    # by launcher name, config substring, or PID
+```
+
+When only one gateway is running, `-i` is unnecessary. When several are running,
+admin commands require `-i` and otherwise print the list to disambiguate.
+
+**B. One shared gateway over HTTP.** Run a single long-lived gateway on a fixed
+port and point both harnesses at the same URL:
+
+```bash
+codemcp start --port 8765     # or: codemcp start -p 8765 -H 0.0.0.0
+```
+
+`start` runs the Streamable HTTP transport and **fails fast if the port is
+already in use**. Configure each harness with a remote MCP entry pointing at
+`http://127.0.0.1:8765/mcp`.
+
 ## How it works
 
 1. **Connect & discover.** On startup codemcp connects to every enabled upstream
@@ -237,15 +281,22 @@ All settings are read once at startup from `CODEMCP_*` environment variables.
 | `CODEMCP_CONFIG` | `~/.config/codemcp/mcp.json` | Path to the upstream `mcp.json`. |
 | `CODEMCP_ISOLATION` | `HOST_SYSTEM` | Execution isolation: `HOST_SYSTEM`, `DOCKER`, `MONTY`. Only `HOST_SYSTEM` is implemented today. |
 | `CODEMCP_TRANSPORT` | `stdio` | Downstream MCP transport: `stdio` or `http`. |
-| `CODEMCP_ADMIN_SOCKET` | `~/.config/codemcp/admin.sock` | Unix socket for the admin CLI (`list`/`enable`/`disable`). Both the gateway and the CLI honor it. |
+| `CODEMCP_ADMIN_SOCKET` | _(per-instance)_ | Override the admin socket path. By default each gateway uses `~/.config/codemcp/admin-<config-hash>-<pid>.sock` so multiple instances don't collide; set this to pin an explicit path. |
+| `CODEMCP_INSTANCE_LABEL` | _(auto)_ | Friendly name for this gateway in `codemcp instances`/`list` (e.g. `opencode`). Falls back to the auto-detected parent process name. |
 | `CODEMCP_LOG` | `info` | Tracing filter (e.g. `info`, `debug`, `codemcp=debug`). |
 | `CODEMCP_PYTHON` | _(auto)_ | Path to the Python interpreter (defaults to `python3`/`python` on `PATH`). |
 
 ### Streamable HTTP transport
 
+The HTTP server binds a **fixed, reliable port** (it does **not** fall back to a
+random port). If the port is already taken — e.g. another codemcp instance — the
+gateway fails to start with a clear error instead of silently moving. Use
+`codemcp start -p <port>` for the common case, or set `CODEMCP_TRANSPORT=http`
+plus the variables below.
+
 | Variable | Default | Description |
 |---|---|---|
-| `CODEMCP_HTTP_BIND` | `127.0.0.1:3388` | Address to bind the HTTP server. |
+| `CODEMCP_HTTP_BIND` | `127.0.0.1:3388` | Address to bind the HTTP server. (`codemcp start --port/--host` overrides this.) |
 | `CODEMCP_HTTP_PATH` | `/mcp` | URL path the MCP endpoint is mounted at. |
 | `CODEMCP_HTTP_JSON_RESPONSE` | `false` | `true` = stateless plain `application/json` replies; `false` = stateful SSE with session IDs. |
 

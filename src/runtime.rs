@@ -18,6 +18,7 @@ use crate::config::{self, ServerSpec};
 use crate::env::Isolation;
 use crate::error::Error;
 use crate::exec::Executor;
+use crate::launcher::Launcher;
 use crate::prompt;
 use crate::sdk::SdkRegistry;
 use crate::upstream::SharedUpstreams;
@@ -49,6 +50,7 @@ struct Inner {
     executor: Arc<dyn Executor>,
     isolation: Isolation,
     config_path: PathBuf,
+    launcher: Launcher,
     /// Boot config: every server (enabled or not), interpolated.
     boot: Mutex<BTreeMap<String, ConfigEntry>>,
     /// Current SDK + description, regenerated on every change.
@@ -69,6 +71,7 @@ impl Runtime {
         executor: Arc<dyn Executor>,
         isolation: Isolation,
         config_path: PathBuf,
+        launcher: Launcher,
         sdk: SdkState,
     ) -> Result<Self, Error> {
         let boot_list = config::load_all(&config_path)?;
@@ -88,11 +91,22 @@ impl Runtime {
                 executor,
                 isolation,
                 config_path,
+                launcher,
                 boot: Mutex::new(boot),
                 sdk: Mutex::new(sdk),
                 peers: Mutex::new(Vec::new()),
             }),
         })
+    }
+
+    /// The config path this gateway was started with.
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.inner.config_path
+    }
+
+    /// The application that launched this gateway.
+    pub fn launcher(&self) -> &Launcher {
+        &self.inner.launcher
     }
 
     /// Current `execute_python` description (clone).

@@ -1,6 +1,6 @@
 [package]
 name = "codemcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Meta-MCP code-mode gateway: connect many MCP servers, expose one execute_python tool."
 license = "MIT"
@@ -35,11 +35,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 which = "8"
 rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 figment = { version = "0.10", features = ["env"] }
 axum = "0.8"
+# Used only to auto-detect the launching application (parent process name) for
+# `codemcp info`/`list`. `system` feature is enough; we don't need disk/net/etc.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # The Monty Rust crate is not published to crates.io under this name; pull from git.
 # Feature-gated and off by default, so default builds never fetch it.

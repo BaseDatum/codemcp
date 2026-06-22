@@ -148,7 +148,33 @@ case ":$PATH:" in
 		;;
 esac
 
+# --- usage: show an MCP config snippet ---------------------------------------
+# Use the bare name when it resolves on PATH, otherwise the absolute path so the
+# snippet is copy-pasteable regardless of PATH state.
+if command -v "$BIN" >/dev/null 2>&1; then
+	cmd="$BIN"
+else
+	cmd="$dest"
+fi
+
+info ""
+info "to use codemcp, point your agent harness at it. MCP config (opencode \"mcp\" object):"
+info ""
+info "  {"
+info "    \"mcp\": {"
+info "      \"codemcp\": {"
+info "        \"type\": \"local\","
+info "        \"command\": [\"$cmd\"],"
+info "        \"environment\": {"
+info "          \"CODEMCP_CONFIG\": \"$HOME/.config/codemcp/mcp.json\","
+info "          \"CODEMCP_INSTANCE_LABEL\": \"lmstudio\""
+info "        },"
+info "        \"enabled\": true"
+info "      }"
+info "    }"
+info "  }"
+
 info ""
 info "done. next steps:"
-info "  $BIN setup opencode      # adopt your existing opencode MCP servers"
+info "  $BIN setup opencode      # adopt your existing opencode MCP servers automatically"
 info "  $BIN --help"

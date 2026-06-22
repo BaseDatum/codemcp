@@ -17,12 +17,62 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::error::Error;
 use crate::runtime::Runtime;
 
-/// Resolve the admin socket path (`CODEMCP_ADMIN_SOCKET` or XDG default).
-pub fn socket_path() -> PathBuf {
+/// Directory that holds per-instance admin sockets.
+fn socket_dir() -> PathBuf {
+    crate::env::config_base().join("codemcp")
+}
+
+/// Filename prefix for discoverable per-instance admin sockets.
+const SOCKET_PREFIX: &str = "admin-";
+
+/// A short, stable hash of the config path so sockets for different configs are
+/// distinguishable at a glance.
+fn config_hash(config_path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    // Canonicalize when possible so equivalent paths map to the same hash.
+    let canon = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    canon.hash(&mut h);
+    format!("{:08x}", (h.finish() as u32))
+}
+
+/// Resolve the admin socket path for *this* running gateway.
+///
+/// `CODEMCP_ADMIN_SOCKET` overrides everything (explicit path). Otherwise the
+/// socket is per-instance: `admin-<config-hash>-<pid>.sock`, so two gateways
+/// (e.g. one per harness) never collide and each is independently addressable.
+pub fn socket_path(config_path: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("CODEMCP_ADMIN_SOCKET") {
         return PathBuf::from(p);
     }
-    crate::env::config_base().join("codemcp").join("admin.sock")
+    let name = format!(
+        "{SOCKET_PREFIX}{}-{}.sock",
+        config_hash(config_path),
+        std::process::id()
+    );
+    socket_dir().join(name)
+}
+
+/// Discover all candidate admin sockets in the socket directory (plus an
+/// explicit `CODEMCP_ADMIN_SOCKET` if set). Does not check liveness.
+pub fn discover_sockets() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(p) = std::env::var("CODEMCP_ADMIN_SOCKET") {
+        out.push(PathBuf::from(p));
+        return out;
+    }
+    if let Ok(entries) = std::fs::read_dir(socket_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with(SOCKET_PREFIX) && name.ends_with(".sock") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,14 +89,15 @@ pub struct EnableParams {
     pub make_default: bool,
 }
 
-/// Start the admin Unix-socket server. Binds the socket (removing any stale one),
-/// sets 0600 perms, and serves requests until the process exits.
+/// Start the admin Unix-socket server on this instance's per-instance socket
+/// path, sets 0600 perms, and serves requests until the process exits.
 pub async fn serve(runtime: Runtime) -> Result<(), Error> {
-    let path = socket_path();
+    let path = socket_path(runtime.config_path());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Remove a stale socket from a previous run.
+    // The path includes our PID, so any file here is a stale leftover from a
+    // crashed process that reused the PID; safe to remove.
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
@@ -104,6 +155,17 @@ async fn handle_conn(stream: UnixStream, runtime: Runtime) -> Result<(), Error> 
 
 async fn dispatch(runtime: &Runtime, req: Request) -> Value {
     match req.method.as_str() {
+        // Lightweight liveness + identity probe used by client-side discovery.
+        "info" => {
+            let l = runtime.launcher();
+            json!({
+                "pid": std::process::id(),
+                "config": runtime.config_path().display().to_string(),
+                "launcher": l.name,
+                "launcher_source": l.source,
+                "parent_pid": l.parent_pid,
+            })
+        }
         "list" => {
             let servers = runtime.list().await;
             json!({ "servers": servers })
@@ -136,10 +198,19 @@ async fn dispatch(runtime: &Runtime, req: Request) -> Value {
     }
 }
 
-/// Client side: send one request to the admin socket and return the response.
-pub async fn client_request(method: &str, params: Value) -> Result<Value, Error> {
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).await.map_err(|e| {
+/// A discovered, live gateway instance.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub socket: PathBuf,
+    pub pid: u64,
+    pub config: String,
+    /// Friendly launcher name (label or detected parent), e.g. `opencode`.
+    pub launcher: String,
+}
+
+/// Send one request to a specific admin socket and return the response.
+async fn request_on(path: &Path, method: &str, params: Value) -> Result<Value, Error> {
+    let stream = UnixStream::connect(path).await.map_err(|e| {
         Error::Other(format!(
             "cannot reach codemcp admin socket at {} ({e}). Is the gateway running?",
             path.display()
@@ -157,4 +228,91 @@ pub async fn client_request(method: &str, params: Value) -> Result<Value, Error>
     let resp: Value = serde_json::from_str(&line)
         .map_err(|e| Error::Other(format!("invalid admin response: {e}")))?;
     Ok(resp)
+}
+
+/// Probe all discovered sockets and return the ones that answer `info` (live).
+pub async fn live_instances() -> Vec<Instance> {
+    let mut out = Vec::new();
+    for socket in discover_sockets() {
+        match request_on(&socket, "info", json!({})).await {
+            Ok(resp) => {
+                let pid = resp.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                let config = resp
+                    .get("config")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let launcher = resp
+                    .get("launcher")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                out.push(Instance {
+                    socket,
+                    pid,
+                    config,
+                    launcher,
+                });
+            }
+            // Dead/stale socket: skip it.
+            Err(_) => continue,
+        }
+    }
+    out
+}
+
+/// Pick the target instance for a client command.
+///
+/// `selector` (from `--instance`) matches against the launcher name or config
+/// path (substring) or an exact PID. With no selector: if exactly one instance
+/// is live, use it; if several, return an error listing them to disambiguate.
+pub async fn select_instance(selector: Option<&str>) -> Result<Instance, Error> {
+    let mut instances = live_instances().await;
+
+    if let Some(sel) = selector {
+        instances.retain(|i| {
+            i.launcher.contains(sel) || i.config.contains(sel) || i.pid.to_string() == sel
+        });
+        match instances.len() {
+            0 => Err(Error::Other(format!(
+                "no running codemcp gateway matches --instance {sel:?}"
+            ))),
+            1 => Ok(instances.remove(0)),
+            _ => Err(Error::Other(format!(
+                "--instance {sel:?} is ambiguous; matches:\n{}",
+                format_instances(&instances)
+            ))),
+        }
+    } else {
+        match instances.len() {
+            0 => Err(Error::Other(
+                "no running codemcp gateway found. Is one started? \
+                 (a gateway runs when a harness launches codemcp, or via `codemcp start`)"
+                    .to_string(),
+            )),
+            1 => Ok(instances.remove(0)),
+            _ => Err(Error::Other(format!(
+                "multiple codemcp gateways are running; pass --instance <launcher|config-substring|pid>:\n{}",
+                format_instances(&instances)
+            ))),
+        }
+    }
+}
+
+fn format_instances(instances: &[Instance]) -> String {
+    instances
+        .iter()
+        .map(|i| format!("  [{}]  pid {}  config {}", i.launcher, i.pid, i.config))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Client side: send one request to the selected gateway's admin socket.
+pub async fn client_request(
+    selector: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<Value, Error> {
+    let instance = select_instance(selector).await?;
+    request_on(&instance.socket, method, params).await
 }

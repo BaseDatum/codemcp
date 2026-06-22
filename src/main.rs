@@ -13,6 +13,7 @@ mod control;
 mod env;
 mod error;
 mod exec;
+mod launcher;
 mod prompt;
 mod runtime;
 mod sdk;
@@ -50,15 +51,33 @@ async fn main() -> Result<()> {
         if command.is_local() {
             return cli::run_local(command).map_err(Into::into);
         }
+        // `start` runs the gateway itself (shared HTTP instance).
+        if command.is_gateway() {
+            let override_http = match command {
+                cli::Command::Start { port, host } => Some((host, port)),
+                _ => unreachable!(),
+            };
+            return run_gateway(override_http).await;
+        }
         // Admin subcommands are a thin client to a running gateway.
         return cli::run_admin(command).await.map_err(Into::into);
     }
 
-    run_gateway().await
+    run_gateway(None).await
 }
 
-async fn run_gateway() -> Result<()> {
-    let settings = Settings::from_env()?;
+/// Run the gateway. When `http_override` is `Some((host, port))` (from
+/// `codemcp start`), force the Streamable HTTP transport on that address;
+/// otherwise honor the `CODEMCP_*` settings.
+async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
+    let mut settings = Settings::from_env()?;
+
+    if let Some((host, port)) = http_override {
+        settings.transport = ServerTransport::Http;
+        settings.http_bind = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --host/--port {host}:{port}: {e}"))?;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&settings.log))
@@ -113,17 +132,42 @@ async fn run_gateway() -> Result<()> {
     let executor: Arc<dyn Executor> =
         Arc::new(HostExecutor::start(&settings, &sdk_py, upstreams.clone()).await?);
     let description = prompt::build_description(&registry, settings.isolation);
+    let launcher = launcher::Launcher::detect();
+    tracing::info!(
+        launcher = %launcher.name,
+        source = ?launcher.source,
+        parent_pid = ?launcher.parent_pid,
+        "detected launching application"
+    );
     let runtime = Runtime::new(
         upstreams.clone(),
         executor,
         settings.isolation,
         settings.config.clone(),
+        launcher,
         SdkState {
             registry,
             description,
         },
     )
     .await?;
+
+    // For HTTP, bind the TCP listener *before* starting the admin server, so a
+    // port conflict fails fast without leaving a stale admin socket behind.
+    let http_listener = match settings.transport {
+        ServerTransport::Http => Some(
+            tokio::net::TcpListener::bind(settings.http_bind)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to bind HTTP endpoint on {} ({e}). \
+                         Is another process (or codemcp instance) already using that port?",
+                        settings.http_bind
+                    )
+                })?,
+        ),
+        ServerTransport::Stdio => None,
+    };
 
     // Admin socket: enable/disable upstreams at runtime.
     {
@@ -162,7 +206,7 @@ async fn run_gateway() -> Result<()> {
             );
 
             let app = axum::Router::new().nest_service(&settings.http_path, service);
-            let listener = tokio::net::TcpListener::bind(settings.http_bind).await?;
+            let listener = http_listener.expect("http listener bound above");
             tracing::info!(
                 bind = %settings.http_bind,
                 path = %settings.http_path,

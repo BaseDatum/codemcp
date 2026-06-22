@@ -96,7 +96,8 @@ fn setup_opencode() -> Result<(), Error> {
                 "type": "local",
                 "command": ["codemcp"],
                 "environment": {
-                    "CODEMCP_CONFIG": codemcp_path.to_string_lossy()
+                    "CODEMCP_CONFIG": codemcp_path.to_string_lossy(),
+                    "CODEMCP_INSTANCE_LABEL": "opencode"
                 },
                 "enabled": true
             }
