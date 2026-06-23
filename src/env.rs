@@ -14,6 +14,11 @@ use serde::Deserialize;
 
 use crate::error::Error;
 
+/// Default fixed port for the Streamable HTTP transport. Used both as the
+/// `CODEMCP_HTTP_BIND` default and the `codemcp start --port` default so the two
+/// stay in sync.
+pub const DEFAULT_HTTP_PORT: u16 = 3388;
+
 /// Python execution isolation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -82,7 +87,7 @@ impl Default for Settings {
             config: default_config_path(),
             isolation: Isolation::HostSystem,
             transport: ServerTransport::Stdio,
-            http_bind: "127.0.0.1:3388".parse().expect("valid default addr"),
+            http_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
             http_path: "/mcp".to_string(),
             http_json_response: false,
             python: None,

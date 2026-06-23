@@ -223,15 +223,22 @@ When only one gateway is running, `-i` is unnecessary. When several are running,
 admin commands require `-i` and otherwise print the list to disambiguate.
 
 **B. One shared gateway over HTTP.** Run a single long-lived gateway on a fixed
-port and point both harnesses at the same URL:
+port (default `3388`) and point both harnesses at the same URL:
 
 ```bash
-codemcp start --port 8765     # or: codemcp start -p 8765 -H 0.0.0.0
+codemcp start                 # listens on 127.0.0.1:3388
+codemcp start --port 3388     # explicit; or -p 3388 -H 0.0.0.0 to expose it
 ```
 
 `start` runs the Streamable HTTP transport and **fails fast if the port is
 already in use**. Configure each harness with a remote MCP entry pointing at
-`http://127.0.0.1:8765/mcp`.
+`http://127.0.0.1:3388/mcp`.
+
+Note: a single shared gateway means one Python worker and one SDK behind that
+port. Concurrent `execute_python` calls from different harnesses are correlated
+correctly (no crosstalk, isolated stdout/result, independent timeouts) and their
+tool round-trips overlap, but they share one interpreter (no CPU parallelism)
+and one global SDK state (an admin `enable`/`disable` affects all clients).
 
 ## How it works
 

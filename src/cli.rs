@@ -36,7 +36,7 @@ pub enum Command {
     /// sharing one codemcp instance between multiple harnesses.
     Start {
         /// TCP port to bind the HTTP MCP endpoint on. Fails if already in use.
-        #[arg(short = 'p', long)]
+        #[arg(short = 'p', long, default_value_t = crate::env::DEFAULT_HTTP_PORT)]
         port: u16,
         /// Address to bind (default 127.0.0.1).
         #[arg(short = 'H', long, default_value = "127.0.0.1")]
